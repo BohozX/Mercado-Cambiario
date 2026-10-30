@@ -1,0 +1,157 @@
+name: Mercado cambiario
+
+on:
+  schedule:
+    - cron: "7 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mercado-cambiario
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  pages: write
+
+jobs:
+  actualizar:
+    if: github.event_name != 'schedule' || vars.MERCADO_CAMBIARIO_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout Core privado
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ secrets.DEV_VAULT_REPOSITORY }}
+          ref: main
+          ssh-key: ${{ secrets.DEV_VAULT_DEPLOY_KEY }}
+          path: private
+          sparse-checkout: |
+            ${{ secrets.DEV_VAULT_CORE_PATH }}
+          sparse-checkout-cone-mode: true
+          persist-credentials: true
+
+      - name: Configurar Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Validar configuracion privada
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          test -n "$CORE_PATH"
+          case "$CORE_PATH" in
+            /*|*..*) echo "Ruta privada no valida" >&2; exit 1 ;;
+          esac
+          test -f "private/$CORE_PATH/codigo/main.py"
+          test -f "private/$CORE_PATH/codigo/verificar_publico.py"
+
+      - name: Instalar dependencias
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --only-binary=:all: -r "private/$CORE_PATH/requirements.txt"
+
+      - name: Ejecutar el motor
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          python -I "private/$CORE_PATH/codigo/main.py"
+
+      - name: Verificar frontera publica
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          python -I "private/$CORE_PATH/codigo/verificar_publico.py" "private/$CORE_PATH/publico"
+
+      - name: Guardar el estado en Dev-Vault
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          git -C private add -- "$CORE_PATH/datos" "$CORE_PATH/estado"
+          if git -C private diff --cached --quiet; then
+            echo "Dev-Vault ya contiene el estado actual."
+            exit 0
+          fi
+          git -C private add -- "$CORE_PATH/registro"
+          git -C private config user.name "Daniel Bohoz Oros Trujillo"
+          git -C private config user.email \
+            "283808960+BohozX@users.noreply.github.com"
+          git -C private commit --quiet -m "${CORE_PATH}: actualizacion automatica"
+          for attempt in 1 2 3; do
+            git -C private pull --rebase origin main
+            if git -C private push origin HEAD:main; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "No se pudo sincronizar Dev-Vault despues de 3 intentos." >&2
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done
+
+      - name: Preparar sitio minimo
+        shell: bash
+        env:
+          CORE_PATH: ${{ secrets.DEV_VAULT_CORE_PATH }}
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          for f in bancos_bcb.json paralelo_bcb.json reservas.json; do
+            cp "private/$CORE_PATH/publico/$f" _site/
+          done
+          test "$(find _site -mindepth 1 | wc -l)" -eq 3
+
+      - name: Configurar Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
+
+      - name: Subir sitio publico
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: _site
+          retention-days: 1
+
+      - name: Desplegar Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128
+
+  cleanup-artifact:
+    name: Eliminar artifact temporal
+    needs: actualizar
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Eliminar artifact del despliegue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "github-pages") | .id' |
+          while read -r artifact_id; do
+            test -n "$artifact_id"
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done
