@@ -116,7 +116,19 @@ jobs:
           for f in bancos_bcb.json reservas.json; do
             cp "private/$CORE_PATH/publico/$f" _site/
           done
-          test "$(find _site -mindepth 1 | wc -l)" -eq 2
+          esperados=2
+          if [ -d "private/$CORE_PATH/publico/historico" ] && [ "$(find "private/$CORE_PATH/publico/historico" -type f | wc -l)" -eq 8 ]; then
+            mkdir -p _site/historico
+            for size in 390 768 1024 1440; do
+              for suffix in "" -en; do
+                cp "private/$CORE_PATH/publico/historico/p2parmy-$size$suffix.png" _site/historico/
+              done
+            done
+            esperados=10
+          else
+            echo "Sin imagenes del historico en esta corrida."
+          fi
+          test "$(find _site -type f | wc -l)" -eq "$esperados"
 
       - name: Configurar Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
